@@ -16,7 +16,7 @@
 
 import random
 from functools import partial
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import flax.linen as nn
 import jax
@@ -35,6 +35,7 @@ from ...modeling_flax_outputs import (
     FlaxCausalLMOutputWithCrossAttentions,
     FlaxSeq2SeqLMOutput,
     FlaxSeq2SeqModelOutput,
+    FlaxSequenceClassifierOutput,
 )
 from ...modeling_flax_utils import (
     ACT2FN,
@@ -168,6 +169,32 @@ WHISPER_DECODE_INPUTS_DOCSTRING = r"""
             more detail.
         return_dict (`bool`, *optional*):
             Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+"""
+
+WHISPER_AUDIO_CLASSIFICATION_INPUTS_DOCSTRING = r"""
+    Args:
+        input_features (`numpy.ndarray` of shape `(batch_size, feature_size, sequence_length)`):
+            Float values mel features extracted from the raw speech waveform. Raw speech waveform can be obtained by
+            loading a `.flac` or `.wav` audio file into an array of type `List[float]` or a `numpy.ndarray`, *e.g.* via
+            the soundfile library (`pip install soundfile`). To prepare the array into `input_features`, the
+            [`WhisperFeatureExtractor`] should be used for extracting the mel features, padding and conversion into a
+            tensor of type `numpy.ndarray`. See [`~WhisperFeatureExtractor.__call__`].
+        encoder_outputs (`tuple(tuple(numpy.ndarray)`, *optional*):
+            Tuple consists of (`last_hidden_state`, *optional*: `hidden_states`, *optional*: `attentions`)
+            `last_hidden_state` of shape `(batch_size, sequence_length, hidden_size)`, *optional*) is a sequence of
+            hidden-states at the output of the last layer of the encoder.
+        output_attentions (`bool`, *optional*):
+            Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
+            tensors for more detail.
+        output_hidden_states (`bool`, *optional*):
+            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
+            more detail.
+        return_dict (`bool`, *optional*):
+            Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+        train (`bool`, *optional*, defaults to `False`):
+            Whether or not to activate dropout modules.
+        freeze_encoder (`bool`, *optional*, defaults to `False`):
+            Whether or not to freeze the weights of the encoder.
 """
 
 
@@ -1468,3 +1495,147 @@ overwrite_call_docstring(
 append_replace_return_docstrings(
     FlaxWhisperForConditionalGeneration, output_type=FlaxSeq2SeqLMOutput, config_class=_CONFIG_FOR_DOC
 )
+
+
+class FlaxWhisperForAudioClassificationModule(nn.Module):
+    config: WhisperConfig
+    dtype: jnp.dtype = jnp.float32  # the dtype of the computation
+
+    def setup(self):
+        self.encoder = FlaxWhisperEncoder(self.config, dtype=self.dtype)
+        num_layers = self.config.num_hidden_layers + 1  # transformer layers + input embeddings
+        if self.config.use_weighted_layer_sum:
+            initializer = jax.nn.initializers.constant(1.0 / num_layers)
+            self.layer_weights = self.param("layer_weights", initializer, num_layers)
+        self.projector = nn.Dense(self.config.classifier_proj_size, dtype=self.dtype)
+        self.classifier = nn.Dense(self.config.num_labels, dtype=self.dtype)
+
+    def __call__(
+        self,
+        input_features: Optional[jnp.ndarray] = None,
+        encoder_outputs: Optional[Tuple[Tuple[jnp.ndarray]]] = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        deterministic: bool = True,
+        freeze_encoder: bool = False,
+    ) -> Union[Tuple[jnp.ndarray], FlaxSequenceClassifierOutput]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if encoder_outputs is None:
+            encoder_outputs = self.encoder(
+                input_features,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                deterministic=deterministic,
+            )
+        if freeze_encoder:
+            encoder_outputs = jax.lax.stop_gradient(encoder_outputs)
+
+        if self.config.use_weighted_layer_sum:
+            hidden_states = jnp.stack(encoder_outputs, axis=1)
+            norm_weights = nn.softmax(self.layer_weights, axis=-1)
+            hidden_states = (hidden_states * norm_weights.view(-1, 1, 1)).sum(axis=1)
+        else:
+            hidden_states = encoder_outputs[0]
+
+        hidden_states = self.projector(hidden_states)
+        pooled_output = hidden_states.mean(axis=1)
+
+        logits = self.classifier(pooled_output)
+
+        if not return_dict:
+            return (logits,) + encoder_outputs[1:]
+
+        return FlaxSequenceClassifierOutput(
+            logits=logits,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+        )
+
+
+@add_start_docstrings(
+    """
+    Whisper Encoder Model with a sequence classification head on top (a linear layer over the pooled output) for tasks
+    like SUPERB Keyword Spotting.
+    """,
+    WHISPER_START_DOCSTRING,
+)
+class FlaxWhisperForAudioClassification(FlaxPreTrainedModel):
+    config_class = WhisperConfig
+    base_model_prefix: str = "model"
+    main_input_name = "input_features"
+
+    def __init__(
+        self,
+        config: WhisperConfig,
+        input_shape: Tuple[int] = (1, 80, 3000),
+        seed: int = 0,
+        dtype: jnp.dtype = jnp.float32,
+        _do_init: bool = True,
+        **kwargs,
+    ):
+        module = FlaxWhisperForAudioClassificationModule(config=config, dtype=dtype, **kwargs)
+        super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
+
+    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
+        # init input tensors
+        input_features = jnp.zeros(input_shape, dtype="f4")
+        input_features = input_features.at[(..., -1)].set(self.config.eos_token_id)
+
+        params_rng, dropout_rng = jax.random.split(rng)
+        rngs = {"params": params_rng, "dropout": dropout_rng}
+
+        random_params = self.module.init(
+            rngs,
+            input_features=input_features,
+        )["params"]
+
+        if params is not None:
+            random_params = flatten_dict(unfreeze(random_params))
+            params = flatten_dict(unfreeze(params))
+            for missing_key in self._missing_keys:
+                params[missing_key] = random_params[missing_key]
+            self._missing_keys = set()
+            return freeze(unflatten_dict(params))
+        else:
+            return random_params
+
+    @add_start_docstrings_to_model_forward(WHISPER_AUDIO_CLASSIFICATION_INPUTS_DOCSTRING)
+    def __call__(
+        self,
+        input_features: Optional[jnp.ndarray] = None,
+        encoder_outputs: Optional[Tuple[Tuple[jnp.ndarray]]] = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        train: bool = False,
+        freeze_encoder: bool = False,
+        params: dict = None,
+        dropout_rng: PRNGKey = None,
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
+
+        # Handle any PRNG if needed
+        rngs = {"dropout": dropout_rng} if dropout_rng is not None else {}
+
+        return self.module.apply(
+            {"params": params or self.params},
+            input_features=input_features,
+            encoder_outputs=encoder_outputs,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            deterministic=not train,
+            freeze_encoder=freeze_encoder,
+            rngs=rngs,
+        )

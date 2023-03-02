@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import functools
 import inspect
 import tempfile
@@ -41,6 +40,7 @@ if is_flax_available():
 
     from transformers import (
         FLAX_MODEL_MAPPING,
+        FlaxWhisperForAudioClassification,
         FlaxWhisperForConditionalGeneration,
         FlaxWhisperModel,
         WhisperFeatureExtractor,
@@ -704,3 +704,159 @@ class FlaxWhisperModelIntegrationTest(unittest.TestCase):
 
         transcript = processor.batch_decode(generated_ids, skip_special_tokens=True, output_offsets=True)
         self.assertEqual(transcript, EXPECTED_TRANSCRIPT)
+
+
+@require_flax
+class FlaxWhisperForAudioClassificationModelTester:
+    config_cls = WhisperConfig
+    config_updates = {}
+    hidden_act = "gelu"
+
+    def __init__(
+        self,
+        parent,
+        batch_size=13,
+        seq_length=60,
+        is_training=True,
+        use_labels=True,
+        vocab_size=99,
+        d_model=16,
+        decoder_attention_heads=4,
+        decoder_ffn_dim=16,
+        decoder_layers=2,
+        encoder_attention_heads=4,
+        encoder_ffn_dim=16,
+        encoder_layers=2,
+        input_channels=1,
+        hidden_act="gelu",
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        max_position_embeddings=70,
+        max_source_positions=30,
+        max_target_positions=40,
+        bos_token_id=98,
+        eos_token_id=98,
+        pad_token_id=0,
+        num_mel_bins=80,
+        decoder_start_token_id=85,
+        num_conv_layers=1,
+        suppress_tokens=None,
+        begin_suppress_tokens=None,
+        classifier_proj_size=4,
+        num_labels=2,
+    ):
+        self.parent = parent
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.is_training = is_training
+        self.use_labels = use_labels
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.hidden_size = d_model
+        self.num_hidden_layers = encoder_layers
+        self.num_attention_heads = encoder_attention_heads
+        self.decoder_attention_heads = decoder_attention_heads
+        self.decoder_ffn_dim = decoder_ffn_dim
+        self.decoder_layers = decoder_layers
+        self.encoder_attention_heads = encoder_attention_heads
+        self.encoder_ffn_dim = encoder_ffn_dim
+        self.encoder_layers = encoder_layers
+        self.encoder_seq_length = seq_length // 2
+        self.decoder_seq_length = 1
+        self.input_channels = input_channels
+        self.hidden_act = hidden_act
+        self.hidden_dropout_prob = hidden_dropout_prob
+        self.attention_probs_dropout_prob = attention_probs_dropout_prob
+        self.num_mel_bins = num_mel_bins
+        self.max_position_embeddings = max_position_embeddings
+        self.max_source_positions = max_source_positions
+        self.max_target_positions = max_target_positions
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+        self.bos_token_id = bos_token_id
+        self.decoder_start_token_id = decoder_start_token_id
+        self.num_conv_layers = num_conv_layers
+        self.suppress_tokens = suppress_tokens
+        self.begin_suppress_tokens = begin_suppress_tokens
+        self.classifier_proj_size = classifier_proj_size
+        self.num_labels = num_labels
+
+    def prepare_config_and_inputs_for_common(self):
+        input_features = floats_tensor([self.batch_size, self.num_mel_bins, self.seq_length])
+
+        config = WhisperConfig(
+            vocab_size=self.vocab_size,
+            num_mel_bins=self.num_mel_bins,
+            decoder_start_token_id=self.decoder_start_token_id,
+            is_encoder_decoder=False,
+            activation_function=self.hidden_act,
+            dropout=self.hidden_dropout_prob,
+            attention_dropout=self.attention_probs_dropout_prob,
+            max_source_positions=self.max_source_positions,
+            max_target_positions=self.max_target_positions,
+            pad_token_id=self.pad_token_id,
+            bos_token_id=self.bos_token_id,
+            eos_token_id=self.eos_token_id,
+            tie_word_embeddings=True,
+            d_model=self.d_model,
+            decoder_attention_heads=self.decoder_attention_heads,
+            decoder_ffn_dim=self.decoder_ffn_dim,
+            decoder_layers=self.decoder_layers,
+            encoder_attention_heads=self.encoder_attention_heads,
+            encoder_ffn_dim=self.encoder_ffn_dim,
+            encoder_layers=self.encoder_layers,
+            suppress_tokens=self.suppress_tokens,
+            begin_suppress_tokens=self.begin_suppress_tokens,
+            classifier_proj_size=self.classifier_proj_size,
+            num_labels=self.num_labels,
+        )
+        return config, {"input_features": input_features}
+
+    def create_and_check_model_forward(self, config, inputs_dict, freeze_encoder=False):
+        model = FlaxWhisperForAudioClassification(
+            config=config, input_shape=(self.batch_size, self.num_mel_bins, self.seq_length)
+        )
+
+        # first forward pass
+        last_hidden_state = model(**inputs_dict, freeze_encoder=freeze_encoder).logits
+
+        self.parent.assertTrue(last_hidden_state.shape, (13, 2))
+
+
+@require_flax
+class FlaxWhisperForAudioClassificationModelTest(FlaxModelTesterMixin, unittest.TestCase):
+    all_model_classes = (FlaxWhisperForAudioClassification,) if is_flax_available() else ()
+    is_encoder_decoder = True
+    test_pruning = False
+    test_head_masking = False
+    test_onnx = False
+
+    def setUp(self):
+        self.model_tester = FlaxWhisperForAudioClassificationModelTester(self)
+        _, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        self.init_shape = (1,) + inputs_dict["input_features"].shape[1:]
+
+        self.all_model_classes = (
+            make_partial_class(model_class, input_shape=self.init_shape) for model_class in self.all_model_classes
+        )
+        self.config_tester = ConfigTester(self, config_class=WhisperConfig)
+
+    def test_config(self):
+        self.config_tester.run_common_tests()
+
+    # overwrite because of `input_features`
+    def test_forward_signature(self):
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            signature = inspect.signature(model.__call__)
+            # signature.parameters is an OrderedDict => so arg_names order is deterministic
+            arg_names = [*signature.parameters.keys()]
+
+            expected_arg_names = ["input_features", "encoder_outputs"]
+            self.assertListEqual(arg_names[:2], expected_arg_names)
+
+    def test_for_audio_classification(self):
+        config_and_inputs = self.model_tester.prepare_config_and_inputs_for_common()
+        self.model_tester.create_and_check_model_forward(*config_and_inputs)

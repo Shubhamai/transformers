@@ -165,6 +165,12 @@ class WhisperConfig(PretrainedConfig):
             The minimum number of masks of length `mask_feature_length` generated along the feature axis, each time
             step, irrespectively of `mask_feature_prob`. Only relevant if
             `mask_feature_prob*len(feature_axis)/mask_feature_length < mask_feature_min_masks`.
+        use_weighted_layer_sum (`bool`, *optional*, defaults to `False`):
+            Whether to use a weighted average of layer outputs with learned weights. Only relevant when using an
+            instance of [`FlaxWhisperForAudioClassification`].
+        classifier_proj_size (`int`, *optional*, defaults to 256):
+            Dimensionality of the projection before token mean-pooling for classification. Only relevant when using an
+            instance of [`FlaxWhisperForAudioClassification`].
 
 
     Example:
@@ -221,6 +227,8 @@ class WhisperConfig(PretrainedConfig):
         mask_feature_prob=0.0,
         mask_feature_length=10,
         mask_feature_min_masks=0,
+        use_weighted_layer_sum=False,
+        classifier_proj_size=256,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -252,6 +260,11 @@ class WhisperConfig(PretrainedConfig):
         self.mask_feature_prob = mask_feature_prob
         self.mask_feature_length = mask_feature_length
         self.mask_feature_min_masks = mask_feature_min_masks
+
+        # Audio Classification-specific parameters. Feel free to ignore for other classes.
+        self.classifier_proj_size = classifier_proj_size
+        self.use_weighted_layer_sum = use_weighted_layer_sum
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
